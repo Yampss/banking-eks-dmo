@@ -60,6 +60,8 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 5
           env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_USER
               value: "postgres"
             - name: POSTGRES_PASSWORD
