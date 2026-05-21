@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account-service
+  namespace: banking
+
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: account-service
+  template:
+    metadata:
+      labels:
+        app: account-service
+    spec:
+      containers:
+        - name: account-service
+          image: cazzzzz/banking-account-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3002
+
+          startupProbe:
+            tcpSocket:
+              port: 3002
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket:
+              port: 3002
+            periodSeconds: 10
+          env:
+            - name: PORT
+              value: "3002"
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: banking-config
+                  key: DB_HOST
+            - name: DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: banking-config
+                  key: DB_PORT
+            - name: DB_NAME
+              value: "accounts_db"
+            - name: DB_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: banking-config
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secrets
+                  key: db-password
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secrets
+                  key: jwt-secret
+            - name: INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: banking-secrets
+                  key: internal-api-key
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: account-service
+  namespace: banking
+
+spec:
+  selector:
+    app: account-service
+  ports:
+    - port: 3002
+      targetPort: 3002
+  type: ClusterIP
