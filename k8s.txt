@@ -1,0 +1,424 @@
+================================================================================
+  k8s/ FOLDER — CHANGES MADE & FILE-BY-FILE EXPLANATION
+  Banking App — EKS Readiness Rework
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILES DELETED
+────────────────────────────────────────────────────────────────────────────────
+
+  pv.yaml  [DELETED]
+  ─────────
+  What it was:
+    A static PersistentVolume using hostPath (/mnt/data/try1).
+    hostPath mounts a folder directly from the node's local disk.
+
+  Why deleted:
+    hostPath only works on single-node local clusters (like minikube or
+    kind). On EKS, pods can land on any node — if the pod restarts on a
+    different node, it can't find the data from the previous node's disk.
+    EKS requires cloud-native storage (EBS) instead. This file was a
+    local learning artifact with no use in a real cluster.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILES ADDED
+────────────────────────────────────────────────────────────────────────────────
+
+  namespace.yaml  [NEW]
+  ──────────────
+  What was added:
+    Creates a Kubernetes namespace called "banking".
+
+  Why added:
+    All existing manifests had no namespace defined, so everything
+    deployed to the "default" namespace. The k8s-deploy.sh script already
+    referenced -n banking on its kubectl wait command, meaning it was
+    waiting in a namespace that didn't exist. This file fixes that.
+    Namespaces also provide logical isolation — all banking app resources
+    are grouped together, making it easy to view, manage, or delete them
+    as a unit (kubectl get all -n banking / kubectl delete namespace banking).
+
+
+  storageclass.yaml  [NEW]
+  ─────────────────
+  What was added:
+    A StorageClass named "ebs-gp3" with these settings:
+      provisioner:         ebs.csi.aws.com       (standard EKS EBS CSI driver)
+      volumeBindingMode:   WaitForFirstConsumer   (waits until a pod is
+                                                   scheduled before creating
+                                                   the volume, so it's created
+                                                   in the right AZ)
+      allowVolumeExpansion: true                  (lets you resize later)
+      reclaimPolicy:       Retain                 (EBS volume survives pod/PVC
+                                                   deletion — data is safe)
+      type: gp3, fsType: ext4
+
+  Why added:
+    The original postgres.yaml had no storageClassName in its
+    volumeClaimTemplate, so it would fall back to the cluster's default
+    StorageClass. On EKS that is gp2 (older, slower, more expensive than
+    gp3). By defining ebs-gp3 explicitly and referencing it in postgres.yaml,
+    we get consistent, faster storage with explicit settings we control.
+
+  NOTE FOR STANDARD EKS vs AUTO MODE:
+    Standard EKS:  provisioner: ebs.csi.aws.com         <-- current value
+    EKS Auto Mode: provisioner: ebs.csi.eks.amazonaws.com
+    These are two different drivers. Using the wrong one causes a
+    "no topology key found" error and the PVC stays Pending forever.
+
+
+  ingress.yaml  [FULLY REPLACED]
+  ────────────
+  What it was before:
+    The entire file was commented out — 46 lines of #-prefixed nginx
+    ingress config. There was no active ingress resource at all.
+
+  What it is now:
+    A live ALB Ingress resource with these annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+        → Creates a public-facing ALB (accessible from the internet)
+      alb.ingress.kubernetes.io/target-type: ip
+        → ALB routes directly to pod IP addresses (not via NodePort)
+        → Required for EKS with VPC CNI networking
+      alb.ingress.kubernetes.io/listen-ports: [{"HTTP": 80}]
+        → ALB listens on port 80 only (HTTP, no HTTPS)
+      ingressClassName: alb
+        → Tells Kubernetes which controller owns this Ingress
+        → Uses spec field instead of deprecated annotation
+
+    Routing rules:
+      /api/users        → user-service:3001
+      /api/accounts     → account-service:3002
+      /api/transactions → transaction-service:3003
+      /                 → frontend:80
+
+  Why replaced:
+    The nginx ingress was for a local cluster with HAProxy in front.
+    For EKS we use the AWS Load Balancer Controller which reads this
+    Ingress object and automatically creates a real AWS ALB.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILES MODIFIED
+────────────────────────────────────────────────────────────────────────────────
+
+  postgres.yaml
+  ─────────────
+  Changes made:
+
+    1. namespace: banking
+       Added to both the Service metadata and the StatefulSet metadata.
+       Before: no namespace field (deployed to "default")
+       After:  namespace: banking
+
+    2. storageClassName: ebs-gp3
+       Added to the volumeClaimTemplate spec.
+       Before: no storageClassName (used cluster default = gp2)
+       After:  storageClassName: ebs-gp3
+       Effect: Postgres PVC now dynamically provisions a real EBS gp3 volume.
+
+    3. PGDATA environment variable  [CRITICAL FIX]
+       Added:
+         - name: PGDATA
+           value: /var/lib/postgresql/data/pgdata
+
+       Why this was needed:
+         When EBS provisions an ext4 volume, it creates a "lost+found"
+         directory at the root of the filesystem. Postgres's initdb
+         checks the data directory and refuses to start if it finds any
+         existing files or folders there — even lost+found.
+         Error seen: "initdb: directory exists but is not empty.
+                      It contains a lost+found directory."
+         Fix: PGDATA tells postgres to use a subdirectory (/pgdata) inside
+         the mount point instead of the mount root itself. The subdirectory
+         doesn't exist yet so initdb can create it cleanly.
+         This is the standard fix for postgres on EBS/EKS.
+
+
+  frontend.yaml
+  ─────────────
+  Changes made:
+
+    1. namespace: banking
+       Added to both Deployment metadata and Service metadata.
+
+    2. Service type changed
+       Before: type: NodePort
+       After:  type: ClusterIP
+
+       Why: NodePort exposes the service on a static port (30000-32767)
+       on every node's IP address. This was used as a workaround for local
+       or HAProxy setups. On EKS with ALB ingress, the ALB connects
+       directly to pod IPs (target-type: ip), so NodePort is unnecessary.
+       ClusterIP is simpler, more secure, and the correct type when a
+       service is behind an ALB.
+
+
+  user-service.yaml
+  ─────────────────
+  Changes made:
+
+    1. namespace: banking
+       Added to both Deployment metadata and Service metadata.
+
+    2. imagePullPolicy changed
+       Before: imagePullPolicy: IfNotPresent
+       After:  imagePullPolicy: Always
+
+       Why: IfNotPresent means Kubernetes uses a cached image if one
+       exists on the node. On EKS with multiple nodes, cached images are
+       unreliable — nodes are replaced by Karpenter/Auto Scaling and start
+       fresh. "Always" guarantees Docker Hub is checked on every pod start,
+       so you always get the image version you pushed.
+
+
+  account-service.yaml
+  ────────────────────
+  Changes made:
+
+    1. namespace: banking
+       Added to both Deployment metadata and Service metadata.
+
+    2. imagePullPolicy: IfNotPresent → Always
+       Same reason as user-service above.
+
+
+  transaction-service.yaml
+  ────────────────────────
+  Changes made:
+
+    1. namespace: banking
+       Added to both Deployment metadata and Service metadata.
+
+    2. imagePullPolicy: IfNotPresent → Always
+       Same reason as user-service above.
+
+
+  configmap.yaml
+  ──────────────
+  Changes made:
+
+    1. namespace: banking
+       Added to ConfigMap metadata.
+
+    Why: ConfigMaps are namespace-scoped. The pods in the "banking"
+    namespace look up this ConfigMap by name within their own namespace.
+    If the ConfigMap is in "default" and the pods are in "banking",
+    the pods cannot find it and fail to start.
+
+  Contents of the ConfigMap (unchanged):
+    DB_HOST:                 "postgres"           (DNS name of the postgres Service)
+    DB_PORT:                 "5432"
+    DB_USER:                 "postgres"
+    USER_SERVICE_URL:        "http://user-service:3001"
+    ACCOUNT_SERVICE_URL:     "http://account-service:3002"
+    TRANSACTION_SERVICE_URL: "http://transaction-service:3003"
+
+
+  secrets.yaml
+  ────────────
+  Changes made:
+
+    1. namespace: banking
+       Added to Secret metadata.
+
+    Why: Same reason as ConfigMap — Secrets are namespace-scoped.
+    Services in "banking" can only read Secrets in "banking".
+
+  Contents of the Secret (unchanged, stringData):
+    db-password:      "bankpass"
+    jwt-secret:       "banking_jwt_chriss"
+    internal-api-key: "internal_secret_key_production"
+
+  WARNING: These values are checked into the repo. Rotate them before
+  any real production use.
+
+
+  postgres-init-configmap.yaml
+  ────────────────────────────
+  Changes made:
+
+    1. namespace: banking
+       Added to ConfigMap metadata.
+
+  Contents of the ConfigMap (unchanged):
+    A shell script (init-multiple-databases.sh) mounted into the postgres
+    container at /docker-entrypoint-initdb.d/. Postgres automatically
+    runs all scripts in that directory on first startup.
+    The script reads the POSTGRES_MULTIPLE_DATABASES env var and creates
+    one database per entry:
+      users_db        → used by user-service
+      accounts_db     → used by account-service
+      transactions_db → used by transaction-service
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILES UNCHANGED (no modifications needed)
+────────────────────────────────────────────────────────────────────────────────
+
+  configmap.yaml data values       — already correct service DNS names
+  secrets.yaml data values         — already set
+  postgres probe commands           — pg_isready checks are fine for EKS
+  all service port numbers          — 3001, 3002, 3003, 5432 unchanged
+  all replica counts                — 2 replicas per service, 1 postgres
+  all Docker Hub image names        — cazzzzz/banking-* unchanged
+
+
+================================================================================
+  HOW IT ALL WORKS NOW — END-TO-END EXPLANATION
+================================================================================
+
+OVERVIEW
+────────
+The banking app runs as a set of Kubernetes resources all inside the
+"banking" namespace on an EKS cluster. External traffic enters through
+an AWS Application Load Balancer, which routes requests to the right
+service based on the URL path. All services talk to a single Postgres
+database running inside the cluster, backed by a persistent EBS volume.
+
+
+WHAT EACH FILE DOES
+───────────────────
+
+  namespace.yaml
+    Creates the "banking" namespace. Everything else lives inside it.
+    Applied first so subsequent resources have somewhere to land.
+
+  storageclass.yaml
+    Defines the "ebs-gp3" StorageClass. This is a template that tells
+    Kubernetes: "whenever something asks for storage using this class,
+    call the EBS CSI driver and create a gp3 EBS volume in AWS."
+    Applied before postgres so the PVC can reference it.
+
+  configmap.yaml
+    Stores non-sensitive configuration as key-value pairs.
+    All three services (user, account, transaction) read from it to know:
+    where Postgres is (DB_HOST=postgres), what port (5432), which user
+    (postgres), and each other's URLs for inter-service calls.
+
+  secrets.yaml
+    Stores sensitive values (DB password, JWT secret, internal API key).
+    Same services read from it using secretKeyRef in their env sections.
+    Values are base64-decoded automatically by Kubernetes at runtime.
+
+  postgres-init-configmap.yaml
+    Holds the database initialisation script. It is mounted as a volume
+    into the postgres container. On first boot, Postgres finds this script
+    and creates three separate databases: users_db, accounts_db,
+    transactions_db. Without this, only the default "postgres" database
+    would exist and all three services would fight over it.
+
+  postgres.yaml  (Service + StatefulSet)
+    The Service (ClusterIP) gives postgres a stable DNS name "postgres"
+    inside the cluster. Other pods connect to it as postgres:5432.
+
+    The StatefulSet runs a single postgres:15-alpine pod (postgres-0).
+    StatefulSet (not Deployment) is used because:
+      - It gives a stable, predictable pod name (postgres-0)
+      - It creates a PersistentVolumeClaim per pod automatically
+      - On restart, the same PVC is reattached to the same pod
+    The volumeClaimTemplate requests a 5Gi EBS gp3 volume using the
+    ebs-gp3 StorageClass. The EBS CSI driver provisions this automatically.
+    PGDATA is set to /var/lib/postgresql/data/pgdata to avoid the
+    lost+found conflict with the EBS mount root.
+
+  user-service.yaml  (Deployment + Service)
+    Deployment runs 2 replicas of the user-service container from Docker Hub.
+    Handles: user registration, login, JWT token issuance.
+    Reads from: users_db in postgres.
+    Service (ClusterIP) exposes it inside the cluster as user-service:3001.
+    The ALB routes /api/users/* to this service.
+
+  account-service.yaml  (Deployment + Service)
+    Deployment runs 2 replicas of the account-service container.
+    Handles: bank account creation, balance queries.
+    Reads from: accounts_db in postgres.
+    Service (ClusterIP) exposes it as account-service:3002.
+    The ALB routes /api/accounts/* to this service.
+
+  transaction-service.yaml  (Deployment + Service)
+    Deployment runs 2 replicas of the transaction-service container.
+    Handles: money transfers, transaction history.
+    Reads from: transactions_db in postgres. Also calls account-service
+    internally (ACCOUNT_SERVICE_URL) to check balances before transferring.
+    Service (ClusterIP) exposes it as transaction-service:3003.
+    The ALB routes /api/transactions/* to this service.
+
+  frontend.yaml  (Deployment + Service)
+    Deployment runs 2 replicas of the nginx-based React frontend.
+    Serves the web UI on port 80.
+    Service (ClusterIP) exposes it as frontend:80 inside the cluster.
+    The ALB routes all other traffic (path /) to this service.
+    Type is ClusterIP — not NodePort or LoadBalancer — because the ALB
+    reaches it directly via pod IP (target-type: ip).
+
+  ingress.yaml
+    The ALB Ingress resource. When applied, the AWS Load Balancer Controller
+    running in kube-system reads it and calls the AWS API to:
+      - Create an internet-facing Application Load Balancer
+      - Create a Target Group for each backend service
+      - Register all matching pod IPs as targets
+      - Set up an HTTP:80 listener with path-based routing rules
+      - Write the ALB DNS name back into the Ingress ADDRESS field
+    Deleting this resource also deletes the ALB from AWS.
+
+
+TRAFFIC FLOW (request lifecycle)
+─────────────────────────────────
+
+  User opens browser
+        │
+        ▼
+  AWS ALB  (internet-facing, HTTP:80)
+  k8s-banking-bankingi-xxxx.us-east-1.elb.amazonaws.com
+        │
+        ├── /api/users/*        ──► user-service Pod (port 3001)
+        │                               │
+        ├── /api/accounts/*     ──► account-service Pod (port 3002)
+        │                               │
+        ├── /api/transactions/* ──► transaction-service Pod (port 3003)
+        │                               │
+        └── /*                  ──► frontend Pod (port 80)
+                                        │
+                            All backend pods ──► postgres:5432
+                                                (ClusterIP Service)
+                                                       │
+                                                 postgres-0 Pod
+                                                (StatefulSet, 1 replica)
+                                                       │
+                                              EBS gp3 Volume (5Gi)
+                                              /var/lib/postgresql/data/pgdata
+                                              (persists across pod restarts)
+
+
+NAMESPACE ISOLATION
+────────────────────
+All resources (Deployments, Services, ConfigMaps, Secrets, StatefulSet,
+PVC, Ingress) live in the "banking" namespace. This means:
+  - kubectl get pods -n banking  shows only banking app pods
+  - kubectl delete namespace banking  removes the entire app at once
+  - ConfigMaps and Secrets are only readable by pods in the same namespace
+  - The ALB Ingress is scoped to the namespace too
+
+
+STORAGE
+────────
+  StorageClass ebs-gp3  →  PVC postgres-storage-postgres-0  →  EBS Volume
+  
+  reclaimPolicy: Retain means if the PVC is deleted, the EBS volume stays
+  in AWS (not deleted). Data is safe even if the whole StatefulSet is torn
+  down. The volume must be manually deleted from the AWS console or CLI.
+
+
+WHAT HAPPENS ON POD RESTART
+─────────────────────────────
+  Stateless pods (user/account/transaction/frontend):
+    Kubernetes creates a new pod, pulls the latest image from Docker Hub
+    (imagePullPolicy: Always), and the pod is ready. No state is lost.
+
+  Postgres (stateful):
+    Kubernetes recreates postgres-0 and reattaches the same EBS volume.
+    All data is intact. PGDATA points to the subdirectory where the
+    database files were written on first boot.
