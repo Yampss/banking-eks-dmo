@@ -1,0 +1,113 @@
+name: NexaBankUserService
+description: Builds NexaBank User Service AMI - installs Node.js 20, copies service code, configures systemd and CloudWatch Agent
+schemaVersion: 1.0
+
+parameters:
+  - BuildBucket:
+      type: string
+      description: S3 bucket where service tarballs are uploaded
+      default: nexabank-ami-builds
+
+phases:
+  - name: build
+    steps:
+      - name: CreateNexabankUser
+        action: ExecuteBash
+        inputs:
+          commands:
+            - useradd -r -s /sbin/nologin nexabank || true
+            - mkdir -p /opt/nexabank /etc/nexabank
+            - chown nexabank:nexabank /opt/nexabank
+
+      - name: InstallNodejs
+        action: ExecuteBash
+        inputs:
+          commands:
+            - dnf install -y curl tar gzip python3
+            - curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+            - dnf install -y nodejs
+            - node --version
+            - npm --version
+
+      - name: InstallAWSCLI
+        action: ExecuteBash
+        inputs:
+          commands:
+            - which aws || (dnf install -y aws-cli)
+            - aws --version
+
+      - name: InstallCloudWatchAgent
+        action: ExecuteBash
+        inputs:
+          commands:
+            - dnf install -y amazon-cloudwatch-agent
+            - systemctl enable amazon-cloudwatch-agent
+
+      - name: DownloadServiceCode
+        action: S3Download
+        inputs:
+          - source: s3://{{ BuildBucket }}/user-service-latest.tar.gz
+            destination: /tmp/user-service.tar.gz
+
+      - name: ExtractAndInstall
+        action: ExecuteBash
+        inputs:
+          commands:
+            - mkdir -p /opt/nexabank/user-service
+            - tar -xzf /tmp/user-service.tar.gz -C /opt/nexabank/user-service
+            - cd /opt/nexabank/user-service && npm install --omit=dev --no-audit
+            - chown -R nexabank:nexabank /opt/nexabank/user-service
+
+      - name: MakeBootstrapExecutable
+        action: ExecuteBash
+        inputs:
+          commands:
+            - chmod +x /opt/nexabank/user-service/bootstrap.sh
+
+      - name: InstallSystemdUnit
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cp /opt/nexabank/user-service/nexabank-user-service.service /etc/systemd/system/
+            - systemctl daemon-reload
+            - systemctl enable nexabank-user-service
+
+      - name: ConfigureCloudWatchAgent
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cp /opt/nexabank/user-service/cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            - /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s || true
+
+      - name: Cleanup
+        action: ExecuteBash
+        inputs:
+          commands:
+            - rm -f /tmp/user-service.tar.gz
+            - dnf clean all
+
+  - name: validate
+    steps:
+      - name: VerifyNodeVersion
+        action: ExecuteBash
+        inputs:
+          commands:
+            - node --version | grep -E "^v20\."
+
+      - name: VerifyServiceCode
+        action: ExecuteBash
+        inputs:
+          commands:
+            - test -f /opt/nexabank/user-service/src/index.js
+            - test -f /opt/nexabank/user-service/bootstrap.sh
+            - test -f /etc/systemd/system/nexabank-user-service.service
+            - systemctl is-enabled nexabank-user-service
+
+      - name: VerifyCloudWatchAgent
+        action: ExecuteBash
+        inputs:
+          commands:
+            - test -f /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            - systemctl is-enabled amazon-cloudwatch-agent

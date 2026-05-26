@@ -1,0 +1,33 @@
+# Force LF line endings for all shell scripts and Linux config files
+# WITHOUT this, Windows git will convert them to CRLF and they will
+# FAIL on EC2 Linux instances with: /bin/bash^M: bad interpreter
+
+# Shell scripts — MUST be LF on Linux
+*.sh         text eol=lf
+
+# Systemd service files — MUST be LF on Linux
+*.service    text eol=lf
+
+# YAML — MUST be LF (some YAML parsers are strict)
+*.yaml       text eol=lf
+*.yml        text eol=lf
+
+# JSON config files
+*.json       text eol=lf
+
+# Everything else — let git decide (CRLF on Windows is fine for these)
+*.js         text eol=lf
+*.md         text eol=lf
+*.txt        text eol=lf
+*.html       text eol=lf
+*.css        text eol=lf
+
+# Binary files — no line ending conversion
+*.png        binary
+*.jpg        binary
+*.gif        binary
+*.ico        binary
+*.woff       binary
+*.woff2      binary
+*.ttf        binary
+*.eot        binary

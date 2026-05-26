@@ -1,0 +1,27 @@
+[Unit]
+Description=NexaBank Account Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexabank
+Group=nexabank
+WorkingDirectory=/opt/nexabank/account-service
+ExecStartPre=/bin/bash /opt/nexabank/account-service/bootstrap.sh
+EnvironmentFile=/etc/nexabank/account-service.env
+ExecStart=/usr/bin/node src/index.js
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nexabank-account-service
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/nexabank /tmp
+
+[Install]
+WantedBy=multi-user.target

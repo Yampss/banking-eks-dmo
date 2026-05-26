@@ -1,0 +1,75 @@
+name: NexaBankTransactionService
+description: Builds NexaBank Transaction Service AMI
+schemaVersion: 1.0
+parameters:
+  - BuildBucket:
+      type: string
+      default: nexabank-ami-builds
+phases:
+  - name: build
+    steps:
+      - name: CreateNexabankUser
+        action: ExecuteBash
+        inputs:
+          commands:
+            - useradd -r -s /sbin/nologin nexabank || true
+            - mkdir -p /opt/nexabank /etc/nexabank
+      - name: InstallNodejs
+        action: ExecuteBash
+        inputs:
+          commands:
+            - dnf install -y curl python3
+            - curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+            - dnf install -y nodejs
+      - name: InstallAWSCLI
+        action: ExecuteBash
+        inputs:
+          commands:
+            - which aws || dnf install -y aws-cli
+      - name: InstallCloudWatchAgent
+        action: ExecuteBash
+        inputs:
+          commands:
+            - dnf install -y amazon-cloudwatch-agent
+            - systemctl enable amazon-cloudwatch-agent
+      - name: DownloadServiceCode
+        action: S3Download
+        inputs:
+          - source: s3://{{ BuildBucket }}/transaction-service-latest.tar.gz
+            destination: /tmp/transaction-service.tar.gz
+      - name: ExtractAndInstall
+        action: ExecuteBash
+        inputs:
+          commands:
+            - mkdir -p /opt/nexabank/transaction-service
+            - tar -xzf /tmp/transaction-service.tar.gz -C /opt/nexabank/transaction-service
+            - cd /opt/nexabank/transaction-service && npm install --omit=dev --no-audit
+            - chown -R nexabank:nexabank /opt/nexabank/transaction-service
+            - chmod +x /opt/nexabank/transaction-service/bootstrap.sh
+      - name: InstallSystemdUnit
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cp /opt/nexabank/transaction-service/nexabank-transaction-service.service /etc/systemd/system/
+            - systemctl daemon-reload
+            - systemctl enable nexabank-transaction-service
+      - name: ConfigureCloudWatchAgent
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cp /opt/nexabank/transaction-service/cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            - systemctl enable amazon-cloudwatch-agent
+      - name: Cleanup
+        action: ExecuteBash
+        inputs:
+          commands:
+            - rm -f /tmp/transaction-service.tar.gz && dnf clean all
+  - name: validate
+    steps:
+      - name: Verify
+        action: ExecuteBash
+        inputs:
+          commands:
+            - test -f /opt/nexabank/transaction-service/src/index.js
+            - test -f /etc/systemd/system/nexabank-transaction-service.service
+            - systemctl is-enabled nexabank-transaction-service
